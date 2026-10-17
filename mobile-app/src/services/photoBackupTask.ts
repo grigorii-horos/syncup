@@ -56,7 +56,10 @@ TaskManager.defineTask(PHOTO_BACKUP_TASK, async () => {
         }
       : undefined;
 
-    await runBackup(config, () => {}, undefined, refreshFolderPath);
+    const syncedFolderPaths = client
+      ? await client.folders().then(fs => fs.map(f => f.path), () => [])
+      : [];
+    await runBackup(config, () => {}, undefined, refreshFolderPath, syncedFolderPaths);
     return BackgroundTask.BackgroundTaskResult.Success;
   } catch {
     return BackgroundTask.BackgroundTaskResult.Failed;

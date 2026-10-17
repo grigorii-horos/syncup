@@ -35,6 +35,17 @@ export interface PhotoBackupConfig {
    * shots from different sources.
    */
   keepOriginalName?: boolean;
+  /**
+   * When a file already exists at the target path: overwrite it (true) or skip
+   * it and treat the asset as backed up (false, default). Either way the asset
+   * counts as backed up, so move mode deletes the original.
+   */
+  overwriteExisting?: boolean;
+  /**
+   * With the byAlbum structure: back up only these album ids. Empty or
+   * missing means every album.
+   */
+  albumIds?: string[];
 }
 
 export interface BackupProgress {
@@ -156,6 +167,17 @@ function isUnder(path: string, root: string): boolean {
   return p === r || p.startsWith(r + '/');
 }
 
+// isInFolders reports whether an on-device file lies inside any of the given
+// Syncthing folder paths (SAF tree URIs or plain paths). Such files are
+// already synced, so photo backup ignores them.
+export function isInFolders(localUri: string, folderPaths: string[]): boolean {
+  const src = stripFileScheme(localUri);
+  return folderPaths.some(f => {
+    const root = resolveTargetRealPath(f);
+    return root != null && isUnder(src, root);
+  });
+}
+
 // albumFromLocalUri returns the immediate parent folder name of an on-disk
 // asset, which on Android matches the gallery's album (bucket) grouping:
 //   file:///storage/emulated/0/DCIM/Camera/IMG_2020.HEIC -> "Camera"
@@ -235,6 +257,7 @@ export async function runBackup(
   onProgress: (p: BackupProgress) => void,
   signal?: { cancelled: boolean },
   refreshFolderPath?: () => Promise<string | null>,
+  syncedFolderPaths: string[] = [],
 ): Promise<BackupProgress> {
   const progress: BackupProgress = {
     phase: 'scanning',
@@ -279,25 +302,40 @@ export async function runBackup(
     }
   })();
 
-  let hasMore = true;
-  let after: string | undefined;
   const toBackUp: MediaLibrary.Asset[] = [];
+  const queued = new Set<string>();
+  const albums: (string | undefined)[] =
+    config.structure === 'byAlbum' && config.albumIds?.length ? config.albumIds : [undefined];
 
-  while (hasMore) {
-    if (signal?.cancelled) break;
-    const page = await MediaLibrary.getAssetsAsync({
-      mediaType,
-      first: 100,
-      after,
-      sortBy: [MediaLibrary.SortBy.creationTime],
-    });
-    for (const asset of page.assets) {
-      if (!backedUp.has(asset.id)) {
-        toBackUp.push(asset);
+  for (const album of albums) {
+    let hasMore = true;
+    let after: string | undefined;
+    while (hasMore) {
+      if (signal?.cancelled) break;
+      let page: MediaLibrary.PagedInfo<MediaLibrary.Asset>;
+      try {
+        page = await MediaLibrary.getAssetsAsync({
+          mediaType,
+          first: 100,
+          after,
+          album,
+          sortBy: [MediaLibrary.SortBy.creationTime],
+        });
+      } catch (e) {
+        // A selected album that was deleted on the device: skip it, keep the rest.
+        if (album) break;
+        throw e;
       }
+      for (const asset of page.assets) {
+        // iOS assets can live in several albums; queue each once.
+        if (!backedUp.has(asset.id) && !queued.has(asset.id)) {
+          queued.add(asset.id);
+          toBackUp.push(asset);
+        }
+      }
+      hasMore = page.hasNextPage;
+      after = page.endCursor;
     }
-    hasMore = page.hasNextPage;
-    after = page.endCursor;
   }
 
   progress.total = toBackUp.length;
@@ -340,6 +378,14 @@ export async function runBackup(
         onProgress({ ...progress });
         continue;
       }
+      // Assets inside another synced folder already reach the other devices.
+      // Not marked as backed up, so they're picked up if that folder is removed.
+      if (srcLocalPath && isInFolders(srcLocalPath, syncedFolderPaths)) {
+        progress.skipped++;
+        progress.lastSkipReason = `"${asset.filename}" already in a synced folder`;
+        onProgress({ ...progress });
+        continue;
+      }
 
       // Build a list of candidate source URIs. localUri is preferred
       // (it's a file:// path for on-device assets). asset.uri is the
@@ -369,8 +415,8 @@ export async function runBackup(
         }
       }
 
-      const exists = await FileSystem.getInfoAsync(targetUri);
-      if (exists.exists) {
+      // Otherwise copyFile below overwrites it (it truncates).
+      if (!config.overwriteExisting && (await FileSystem.getInfoAsync(targetUri)).exists) {
         backedUp.add(asset.id);
         deletable.push(asset);
         progress.skipped++;

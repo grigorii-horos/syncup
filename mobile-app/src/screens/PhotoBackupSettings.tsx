@@ -1,7 +1,10 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
+import * as MediaLibrary from 'expo-media-library/legacy';
 import {
   ActivityIndicator,
   Alert,
+  Image,
+  Platform,
   ScrollView,
   StyleSheet,
   Switch,
@@ -18,6 +21,7 @@ import {
   type MediaFilter,
   type PhotoBackupConfig,
   clearConfig,
+  isInFolders,
   loadConfig,
   runBackup,
   saveConfig,
@@ -59,6 +63,9 @@ export function PhotoBackupSettings({ onBack }: Props) {
   const [loading, setLoading] = useState(true);
   const [progress, setProgress] = useState<BackupProgress | null>(null);
   const cancelRef = useRef({ cancelled: false });
+  const [albums, setAlbums] = useState<{ album: MediaLibrary.Album; preview?: string }[] | null>(
+    null,
+  );
 
   useEffect(() => {
     (async () => {
@@ -71,6 +78,38 @@ export function PhotoBackupSettings({ onBack }: Props) {
       setLoading(false);
     })();
   }, [client]);
+
+  const byAlbum = config?.structure === 'byAlbum';
+  useEffect(() => {
+    if (!byAlbum || albums || loading) return;
+    (async () => {
+      const { status } = await MediaLibrary.requestPermissionsAsync();
+      if (status !== 'granted') return setAlbums([]);
+      const list = await MediaLibrary.getAlbumsAsync().catch(() => [] as MediaLibrary.Album[]);
+      const folderPaths = folders.map(f => f.path);
+      const rows = await Promise.all(
+        list.map(async album => {
+          // The newest asset doubles as the thumbnail and tells us where the
+          // album lives on disk (Android albums are single directories).
+          const first = await MediaLibrary.getAssetsAsync({
+            album,
+            first: 1,
+            sortBy: [[MediaLibrary.SortBy.creationTime, false]],
+          }).catch(() => null);
+          const asset = first?.assets[0];
+          if (!asset) return { album };
+          const info = await MediaLibrary.getAssetInfoAsync(asset).catch(() => null);
+          if (info?.localUri && isInFolders(info.localUri, folderPaths)) return null;
+          return { album, preview: thumbUri(asset) };
+        }),
+      );
+      setAlbums(
+        rows
+          .filter(r => r != null)
+          .sort((a, b) => a.album.title.localeCompare(b.album.title)),
+      );
+    })();
+  }, [byAlbum, albums, loading, folders]);
 
   const enabled = config?.enabled ?? false;
 
@@ -137,7 +176,13 @@ export function PhotoBackupSettings({ onBack }: Props) {
       }
     };
 
-    const result = await runBackup(config, setProgress, cancelRef.current, refreshPath);
+    const result = await runBackup(
+      config,
+      setProgress,
+      cancelRef.current,
+      refreshPath,
+      folders.map(f => f.path),
+    );
     if (result.phase === 'done' && result.copied > 0) {
       try {
         await client.scanFolder(config.folderId);
@@ -269,6 +314,57 @@ export function PhotoBackupSettings({ onBack }: Props) {
               })}
             </View>
 
+            {byAlbum && (
+              <>
+                <Text style={styles.sectionLabel}>Albums</Text>
+                <Text style={styles.toggleHint}>
+                  Pick the albums to back up. None selected = all albums. Albums inside
+                  folders you already sync are hidden and skipped.
+                </Text>
+                {albums === null ? (
+                  <ActivityIndicator color={colors.accent} />
+                ) : albums.length === 0 ? (
+                  <Text style={styles.toggleHint}>No albums found (check photo permission).</Text>
+                ) : (
+                  <View style={styles.optionGroup}>
+                    {albums.map(({ album: a, preview }) => {
+                      const selected = config.albumIds?.includes(a.id) ?? false;
+                      return (
+                        <Focusable
+                          key={a.id}
+                          style={[styles.optionRow, selected && styles.optionRowActive]}
+                          onPress={() =>
+                            updateConfig({
+                              albumIds: selected
+                                ? config.albumIds!.filter(id => id !== a.id)
+                                : [...(config.albumIds ?? []), a.id],
+                            })
+                          }
+                        >
+                          {preview ? (
+                            <Image
+                              source={{ uri: preview }}
+                              style={styles.albumThumb}
+                              resizeMethod="resize"
+                            />
+                          ) : (
+                            <View style={styles.albumThumb} />
+                          )}
+                          <View style={{ flex: 1 }}>
+                            <Text style={[styles.optionText, selected && styles.optionTextActive]}>
+                              {a.title}
+                            </Text>
+                            <Text style={styles.optionExample}>{a.assetCount} items</Text>
+                          </View>
+                          {selected && <Text style={styles.check}>✓</Text>}
+                        </Focusable>
+                      );
+                    })}
+                  </View>
+                )}
+              </>
+            )}
+
             <View style={styles.toggleRow}>
               <View style={{ flex: 1 }}>
                 <Text style={styles.toggleLabel}>Keep original filename</Text>
@@ -314,6 +410,21 @@ export function PhotoBackupSettings({ onBack }: Props) {
               <Switch
                 value={config.deleteAfterBackup ?? false}
                 onValueChange={toggleMove}
+                trackColor={{ true: colors.accent, false: colors.border }}
+              />
+            </View>
+
+            <View style={styles.toggleRow}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.toggleLabel}>Overwrite existing files</Text>
+                <Text style={styles.toggleHint}>
+                  On = copy again over a file with the same name in the backup folder. Off =
+                  keep the existing file and skip the photo.
+                </Text>
+              </View>
+              <Switch
+                value={config.overwriteExisting ?? false}
+                onValueChange={v => updateConfig({ overwriteExisting: v })}
                 trackColor={{ true: colors.accent, false: colors.border }}
               />
             </View>
@@ -440,6 +551,15 @@ function Header({ onBack }: { onBack: () => void }) {
   );
 }
 
+// On Android asset.uri is a raw file path that the image loader may not be
+// allowed to read; the MediaStore content URI works under the media permission
+// and also yields thumbnails for videos.
+function thumbUri(asset: MediaLibrary.Asset): string {
+  if (Platform.OS !== 'android') return asset.uri;
+  const kind = asset.mediaType === MediaLibrary.MediaType.video ? 'video' : 'images';
+  return `content://media/external/${kind}/media/${asset.id}`;
+}
+
 function defaultConfig(folders: FolderConfig[]): PhotoBackupConfig {
   const f = folders[0];
   return {
@@ -507,6 +627,13 @@ const styles = StyleSheet.create({
   optionRowActive: {},
   optionText: { color: colors.text, fontSize: 14, flex: 1 },
   optionTextActive: { fontWeight: '600' },
+  albumThumb: {
+    width: 44,
+    height: 44,
+    borderRadius: 6,
+    marginRight: 12,
+    backgroundColor: colors.border,
+  },
   optionExample: { color: colors.textDim, fontSize: 11, fontFamily: 'Menlo', marginTop: 2 },
   check: { color: colors.accent, fontSize: 16, fontWeight: '700' },
   progressCard: {
